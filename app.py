@@ -203,8 +203,71 @@ def do_recompute(month):
                   json={"receive_id": FRANKIE, "msg_type": "text", "content": json.dumps({"text": msg}, ensure_ascii=False)}, timeout=20)
     return {"complete": complete, "resolved": resolved, "total": total_ship, "msg": msg}
 
+C3_APP_ID = os.environ.get("C3_APP_ID", "")
+C3_APP_SECRET = os.environ.get("C3_APP_SECRET", "")
+REMINDER_JOB = "国内渠道商务专员"
+
+def c3_tok():
+    r = requests.post(f"{FEISHU}/auth/v3/tenant_access_token/internal",
+                      json={"app_id": C3_APP_ID, "app_secret": C3_APP_SECRET}, timeout=20)
+    return r.json()["tenant_access_token"]
+
+def resolve_target():
+    """按职务实时查(聪哥1号)→ email → 聪哥3号 open_id。不硬编码人名。"""
+    T = tok()
+    deps = requests.get(f"{FEISHU}/contact/v3/departments?parent_department_id=0&fetch_child=true&page_size=50&department_id_type=open_department_id",
+                        headers={"Authorization": f"Bearer {T}"}, timeout=20).json()
+    dep_ids = ["0"] + [d["open_department_id"] for d in deps.get("data", {}).get("items", [])]
+    seen = set(); email = None; name = None
+    for did in dep_ids:
+        pt = None
+        while True:
+            u = f"{FEISHU}/contact/v3/users?department_id={did}&page_size=50&user_id_type=open_id&department_id_type=open_department_id" + (f"&page_token={pt}" if pt else "")
+            try: d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=20).json()
+            except: break
+            for usr in d.get("data", {}).get("items", []):
+                if usr.get("open_id") in seen: continue
+                seen.add(usr.get("open_id"))
+                if REMINDER_JOB in (usr.get("job_title") or ""):
+                    email = usr.get("email") or usr.get("enterprise_email"); name = usr.get("name")
+            if d.get("data", {}).get("has_more"): pt = d["data"]["page_token"]
+            else: break
+        if email: break
+    if not email: return None, None
+    # 聪哥3号 namespace open_id by email
+    T3 = c3_tok()
+    r = requests.post(f"{FEISHU}/contact/v3/users/batch_get_id?user_id_type=open_id",
+                      headers={"Authorization": f"Bearer {T3}", "Content-Type": "application/json"},
+                      json={"emails": [email]}, timeout=20).json()
+    lst = r.get("data", {}).get("user_list", [])
+    oid = lst[0].get("user_id") if lst else None
+    return oid, name
+
+def build_card(month_hint):
+    return {"config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": f"📦 国内分销 物流账单提醒 · {month_hint}账单"}, "template": "blue"},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"威哥，**{month_hint}** 的中通/顺丰账单出了，请上传到「物流账单上传台」。\n两个顺丰账号(957/956)+中通账单都传上后，点下面按钮，我自动算出当月净毛利。"}},
+                {"tag": "action", "actions": [
+                    {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 账单已传完，开始算"},
+                     "type": "primary", "value": {"action": "recompute_offline"}}]}]}
+
 @app.get("/health")
 def health(): return {"ok": True}
+
+@app.post("/send-reminder")
+async def send_reminder(request: Request):
+    if AUTH_TOKEN and request.headers.get("Authorization") != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(401, "unauthorized")
+    last = datetime.date.today().replace(day=1) - datetime.timedelta(days=1)
+    mh = last.strftime("%Y-%m")
+    oid, name = resolve_target()
+    if not oid: return {"ok": False, "err": "职务未解析到人"}
+    T3 = c3_tok()
+    r = requests.post(f"{FEISHU}/im/v1/messages?receive_id_type=open_id",
+                      headers={"Authorization": f"Bearer {T3}", "Content-Type": "application/json"},
+                      json={"receive_id": oid, "msg_type": "interactive", "content": json.dumps(build_card(mh), ensure_ascii=False)}, timeout=20).json()
+    return {"ok": r.get("code") == 0, "target": name, "month": mh, "code": r.get("code")}
 
 @app.post("/recompute")
 async def recompute(request: Request, month: str = ""):
