@@ -218,7 +218,7 @@ def resolve_target():
     deps = requests.get(f"{FEISHU}/contact/v3/departments?parent_department_id=0&fetch_child=true&page_size=50&department_id_type=open_department_id",
                         headers={"Authorization": f"Bearer {T}"}, timeout=20).json()
     dep_ids = ["0"] + [d["open_department_id"] for d in deps.get("data", {}).get("items", [])]
-    seen = set(); email = None; name = None
+    seen = set(); email = None; mobile = None; name = None
     for did in dep_ids:
         pt = None
         while True:
@@ -229,18 +229,22 @@ def resolve_target():
                 if usr.get("open_id") in seen: continue
                 seen.add(usr.get("open_id"))
                 if REMINDER_JOB in (usr.get("job_title") or ""):
-                    email = usr.get("email") or usr.get("enterprise_email"); name = usr.get("name")
+                    email = usr.get("email") or usr.get("enterprise_email")
+                    mobile = usr.get("mobile"); name = usr.get("name")
             if d.get("data", {}).get("has_more"): pt = d["data"]["page_token"]
             else: break
-        if email: break
-    if not email: return None, None
-    # 聪哥3号 namespace open_id by email
+        if email or mobile: break
+    if not (email or mobile): return None, None
+    # 聪哥3号 namespace open_id by mobile(优先,同事多无email)或 email
     T3 = c3_tok()
+    body = {}
+    if mobile: body["mobiles"] = [mobile]
+    if email: body["emails"] = [email]
     r = requests.post(f"{FEISHU}/contact/v3/users/batch_get_id?user_id_type=open_id",
                       headers={"Authorization": f"Bearer {T3}", "Content-Type": "application/json"},
-                      json={"emails": [email]}, timeout=20).json()
+                      json=body, timeout=20).json()
     lst = r.get("data", {}).get("user_list", [])
-    oid = lst[0].get("user_id") if lst else None
+    oid = next((x.get("user_id") for x in lst if x.get("user_id")), None)
     return oid, name
 
 def build_card(month_hint):
