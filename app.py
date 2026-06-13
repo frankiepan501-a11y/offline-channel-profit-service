@@ -16,6 +16,7 @@ SF_CW = os.environ["SF_CHECKWORD"]
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 APP = "JqZwbSi7uaDlw0sjEFPcTDlenMf"; O = "tblJ7Z9cUGTz8fsu"; UP = "tblSdk9uVmDRgzJq"
 DX = "tblgTajhPMenNmI6"; PROD = "tbl4d30zXJRFQbPD"; FRANKIE = "ou_629ce01f4bc31de078e10fcb038dbf78"
+FIN_APP = "P9awbhG9faFstxsO1KZc9b9Qnxb"; OVERVIEW_TBL = "tbltFK8vwdcrlfBa"  # 全渠道销售总览
 FEISHU = "https://open.feishu.cn/open-apis"
 app = FastAPI()
 
@@ -143,7 +144,41 @@ def report(T, month):
     lines = [f"总收入 {tr:.0f} | 净毛利 {tm:.0f} ({tm/tr*100 if tr else 0:.1f}%) | 物流 {tw:.0f}"]
     for c, v in top:
         lines.append(f"  {c}: 收入{v[0]:.0f} 净毛利{v[1]:.0f} ({v[1]/v[0]*100 if v[0] else 0:.1f}%)")
-    return "\n".join(lines)
+    return "\n".join(lines), {"rev": tr, "ml": tm, "wl": tw}
+
+
+def upsert_overview(T, month, t):
+    """灌全渠道总表 c国内线下汇总行(幂等, 对齐现有行格式: 销售/物流/毛利/毛利率)。"""
+    if t["rev"] <= 0 and t["ml"] == 0:
+        return "skip(无数据)"
+    fields = {"月份": month, "渠道大类": "国内线下", "平台": "线下",
+              "店铺": "经销分销汇总(买断+代销/寄售+赠样)",
+              "销售额RMB": round(t["rev"], 2), "物流费RMB": round(t["wl"], 2),
+              "全额毛利RMB": round(t["ml"], 2),
+              "毛利率": round(t["ml"] / t["rev"], 4) if t["rev"] else 0}
+    found = None
+    for rec in _ovw_recs(T):   # 总表在 FIN_APP, getall() 用的是c渠道APP, 故单独拉
+        f = rec["fields"]
+        if gv(f, "月份") == month and gv(f, "平台") == "线下":
+            found = rec["record_id"]; break
+    H = {"Authorization": f"Bearer {T}", "Content-Type": "application/json"}
+    if found:
+        requests.put(f"{FEISHU}/bitable/v1/apps/{FIN_APP}/tables/{OVERVIEW_TBL}/records/{found}",
+                     headers=H, json={"fields": fields}, timeout=30)
+        return "updated"
+    requests.post(f"{FEISHU}/bitable/v1/apps/{FIN_APP}/tables/{OVERVIEW_TBL}/records",
+                  headers=H, json={"fields": fields}, timeout=30)
+    return "created"
+
+
+def _ovw_recs(T):
+    items = []; pt = None
+    while True:
+        u = f"{FEISHU}/bitable/v1/apps/{FIN_APP}/tables/{OVERVIEW_TBL}/records?page_size=500" + (f"&page_token={pt}" if pt else "")
+        d = requests.get(u, headers={"Authorization": f"Bearer {T}"}, timeout=30).json().get("data", {})
+        items += (d.get("items") or []); pt = d.get("page_token")
+        if not d.get("has_more"): break
+    return items
 
 def do_recompute(month):
     T = tok()
@@ -190,8 +225,10 @@ def do_recompute(month):
     total_ship = sum(1 for o, rs in orders.items() if any(r["way"] in ("经销买断", "代销月结", "寄售", "赠样") for r in rs) and not any(r["logi"] == "自提/无物流" for r in rs))
     resolved = total_ship - len(unresolved) - len(no_wn)
     complete = (len(no_wn) == 0 and len(unresolved) == 0)
-    summ = report(T, month)
-    lines = [f"📊 国内分销c渠道 {month} 月度重算完成", summ, f"运费覆盖: {resolved}/{total_ship}单已解析"]
+    summ, totals = report(T, month)
+    ovw = upsert_overview(T, month, totals)   # 自动灌全渠道总表 c行(本次新增)
+    lines = [f"📊 国内分销c渠道 {month} 月度重算完成", summ, f"运费覆盖: {resolved}/{total_ship}单已解析",
+             f"已{ovw}总表(国内线下行)"]
     if no_wn: lines.append(f"⚠️ {len(no_wn)}单缺运单号: {', '.join(no_wn[:6])}")
     if zto_miss: lines.append(f"⚠️ {len(zto_miss)}单中通运费缺(账单未传/未出): {', '.join(zto_miss[:6])}")
     if sf_miss: lines.append(f"⚠️ {len(sf_miss)}单顺丰运费缺(单号疑错): {', '.join(sf_miss[:6])}")
@@ -201,7 +238,7 @@ def do_recompute(month):
     requests.post(f"{FEISHU}/im/v1/messages?receive_id_type=open_id",
                   headers={"Authorization": f"Bearer {T}", "Content-Type": "application/json"},
                   json={"receive_id": FRANKIE, "msg_type": "text", "content": json.dumps({"text": msg}, ensure_ascii=False)}, timeout=20)
-    return {"complete": complete, "resolved": resolved, "total": total_ship, "msg": msg}
+    return {"complete": complete, "resolved": resolved, "total": total_ship, "overview": ovw, "msg": msg}
 
 C3_APP_ID = os.environ.get("C3_APP_ID", "")
 C3_APP_SECRET = os.environ.get("C3_APP_SECRET", "")
