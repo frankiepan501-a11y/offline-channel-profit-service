@@ -119,12 +119,16 @@ def sf_freight(wb, sfx):
 def report(T, month):
     """净毛利报表(B口径: 买断+赠样 from 订单台, 代销/寄售 from 动销表, 铺货运费渠道扣)"""
     od = getall(T, O); dx = getall(T, DX); mk = dg(month)
-    rows = []
+    rows = []; paid = 0.0
     for r in od:
         f = r["fields"]; d = gv(f, "下单/出货日期")
         if not d.isdigit(): continue
         if datetime.datetime.utcfromtimestamp(int(d) / 1000).strftime("%Y-%m") != month: continue
         way = gv(f, "合作方式"); qty = num(gv(f, "数量")); cg = num(gv(f, "单位成本(自动)")); wl = num(gv(f, "物流成本(待接)"))
+        # 回款(实收 A): 优先「已收金额」(部分回款时填); 未填则买断单「收款状态=已收」按订单金额(全款)派生。
+        # 代销月结/寄售按月结后到账, 现无追踪→不计入(回款率会偏保守, 诚实口径)。
+        _pa = num(gv(f, "已收金额"))
+        paid += _pa if _pa > 0 else (num(gv(f, "订单金额")) if (gv(f, "收款状态") == "已收" and way == "经销买断") else 0)
         if way in ("经销买断", "赠样"):
             rev = num(gv(f, "订单金额")) if way == "经销买断" else 0
             ml = num(gv(f, "毛利(自动)")) if gv(f, "毛利(自动)") else (rev - qty * cg - wl)
@@ -144,7 +148,7 @@ def report(T, month):
     lines = [f"总收入 {tr:.0f} | 净毛利 {tm:.0f} ({tm/tr*100 if tr else 0:.1f}%) | 物流 {tw:.0f}"]
     for c, v in top:
         lines.append(f"  {c}: 收入{v[0]:.0f} 净毛利{v[1]:.0f} ({v[1]/v[0]*100 if v[0] else 0:.1f}%)")
-    return "\n".join(lines), {"rev": tr, "ml": tm, "wl": tw}
+    return "\n".join(lines), {"rev": tr, "ml": tm, "wl": tw, "paid": paid}
 
 
 def upsert_overview(T, month, t):
@@ -155,7 +159,9 @@ def upsert_overview(T, month, t):
               "店铺": "经销分销汇总(买断+代销/寄售+赠样)",
               "销售额RMB": round(t["rev"], 2), "物流费RMB": round(t["wl"], 2),
               "全额毛利RMB": round(t["ml"], 2),
-              "毛利率": round(t["ml"] / t["rev"], 4) if t["rev"] else 0}
+              "毛利率": round(t["ml"] / t["rev"], 4) if t["rev"] else 0,
+              "回款RMB": round(t.get("paid", 0), 2),
+              "回款率": round(t.get("paid", 0) / t["rev"], 4) if t["rev"] else 0}
     found = None
     for rec in _ovw_recs(T):   # 总表在 FIN_APP, getall() 用的是c渠道APP, 故单独拉
         f = rec["fields"]
